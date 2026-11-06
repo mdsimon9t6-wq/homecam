@@ -68,6 +68,8 @@ jobs:
               <uses-permission android:name="android.permission.INTERNET" />
               <uses-permission android:name="android.permission.FOREGROUND_SERVICE" />
               <uses-permission android:name="android.permission.FOREGROUND_SERVICE_CAMERA" />
+              <uses-permission android:name="android.permission.FOREGROUND_SERVICE_MICROPHONE" />
+              <uses-permission android:name="android.permission.RECORD_AUDIO" />
               <uses-permission android:name="android.permission.POST_NOTIFICATIONS" />
               <uses-permission android:name="android.permission.WAKE_LOCK" />
               <uses-permission android:name="android.permission.REQUEST_IGNORE_BATTERY_OPTIMIZATIONS" />
@@ -91,7 +93,7 @@ jobs:
                   <service
                       android:name=".CameraService"
                       android:exported="false"
-                      android:foregroundServiceType="camera" />
+                      android:foregroundServiceType="camera|microphone" />
               </application>
           </manifest>
           HOMECAM_EOF
@@ -99,6 +101,7 @@ jobs:
           cat > app/src/main/java/bd/homecam/CameraService.kt <<'HOMECAM_EOF'
           package bd.homecam
 
+          import android.Manifest
           import android.app.Notification
           import android.app.NotificationChannel
           import android.app.NotificationManager
@@ -107,14 +110,21 @@ jobs:
           import android.content.Context
           import android.content.Intent
           import android.content.IntentFilter
+          import android.content.pm.PackageManager
           import android.content.pm.ServiceInfo
           import android.graphics.Bitmap
           import android.graphics.Matrix
+          import android.media.AudioAttributes
+          import android.media.AudioManager
+          import android.media.MediaPlayer
+          import android.media.MediaRecorder
           import android.os.BatteryManager
+          import android.os.Build
           import android.os.Handler
           import android.os.Looper
           import android.os.PowerManager
           import android.util.Size
+          import androidx.camera.core.Camera
           import androidx.camera.core.CameraSelector
           import androidx.camera.core.ImageAnalysis
           import androidx.camera.core.ImageProxy
@@ -137,6 +147,7 @@ jobs:
           import java.util.Locale
           import java.util.concurrent.ExecutorService
           import java.util.concurrent.Executors
+          import java.util.concurrent.atomic.AtomicBoolean
           import kotlin.math.abs
 
           class CameraService : LifecycleService() {
@@ -158,6 +169,16 @@ jobs:
               private var recording: Recording? = null
               private var wakeLock: PowerManager.WakeLock? = null
               private var poller: Thread? = null
+              private var camera: Camera? = null
+              private var torchOn = false
+              private val liveBusy = AtomicBoolean(false)
+              @Volatile private var liveUntil = 0L
+              @Volatile private var liveMsgId = 0L
+              @Volatile private var quietUntil = 0L
+              private var lastLive = 0L
+              private var recorder: MediaRecorder? = null
+              private var chunkEnd: Runnable? = null
+              @Volatile private var listenUntil = 0L
 
               @Volatile private var armed = true
               @Volatile private var sens = 60
@@ -206,10 +227,9 @@ jobs:
                   cacheDir.listFiles()?.forEach { if (it.name.startsWith("clip_")) it.delete() }
 
                   createChannel()
-                  ServiceCompat.startForeground(
-                      this, 1, buildNotification(),
-                      ServiceInfo.FOREGROUND_SERVICE_TYPE_CAMERA
-                  )
+                  var fgType = ServiceInfo.FOREGROUND_SERVICE_TYPE_CAMERA
+                  if (hasMic()) fgType = fgType or ServiceInfo.FOREGROUND_SERVICE_TYPE_MICROPHONE
+                  ServiceCompat.startForeground(this, 1, buildNotification(), fgType)
                   running = true
                   startedAt = System.currentTimeMillis()
 
@@ -254,17 +274,17 @@ jobs:
 
                           prov.unbindAll()
                           try {
-                              prov.bindToLifecycle(this, selector, analysis, video)
+                              camera = prov.bindToLifecycle(this, selector, analysis, video)
                               videoCapture = video
                           } catch (e: Exception) {
                               prov.unbindAll()
-                              prov.bindToLifecycle(this, selector, analysis)
+                              camera = prov.bindToLifecycle(this, selector, analysis)
                               videoCapture = null
                               notifyText("ℹ️ এই ফোনে ভিডিও রেকর্ডিং চলে না, শুধু ছবি পাঠানো হবে।")
                           }
                           val b = batteryPercent()
                           val mode = if (armed) "নড়াচড়া হলে নিজে থেকে ছবি ও ভিডিও আসবে" else "আপনি চাইলে তবেই ছবি/ভিডিও আসবে"
-                          notifyText("✅ HomeCam চালু হয়েছে। ব্যাটারি $b%।\n$mode\n/photo ছবি, /video ভিডিও, /status অবস্থা, /arm নিজে থেকে চালু, /disarm বন্ধ")
+                          notifyText("✅ HomeCam চালু হয়েছে। ব্যাটারি $b%।\n$mode\n/live লাইভ ছবি, /listen আশপাশের শব্দ শোনা, /stop বন্ধ\n/flash ফ্ল্যাশ চালু-বন্ধ\nফোনে কিছু বলতে বটে ভয়েস মেসেজ পাঠান\n/photo ছবি, /video ভিডিও, /status অবস্থা\n/arm নিজে থেকে পাঠানো চালু, /disarm বন্ধ")
                       } catch (e: Exception) {
                           notifyText("❌ ক্যামেরা চালু করা যায়নি: ${e.message}")
                           stopSelf()
@@ -285,6 +305,26 @@ jobs:
                       val w = image.width
                       val h = image.height
 
+                      if (now < liveUntil && now - lastLive >= 2500 && liveBusy.compareAndSet(false, true)) {
+                          lastLive = now
+                          val jpeg = toJpeg(image, 640, 60)
+                          if (jpeg == null) {
+                              liveBusy.set(false)
+                          } else {
+                              val cap = "🔴 LIVE " + stamp()
+                              io.execute {
+                                  try {
+                                      val id = liveMsgId
+                                      if (id == 0L || !tg.editPhoto(id, jpeg, cap)) {
+                                          liveMsgId = tg.sendPhotoId(jpeg, cap) ?: 0L
+                                      }
+                                  } finally {
+                                      liveBusy.set(false)
+                                  }
+                              }
+                          }
+                      }
+
                       val cur = ByteArray(GRID_W * GRID_H)
                       for (y in 0 until GRID_H) {
                           val row = y * h / GRID_H
@@ -297,6 +337,7 @@ jobs:
                       prev = cur
                       if (old == null) return
                       if (now - startedAt < 4000) return // camera exposure settling
+                      if (now < quietUntil) { hits = 0; return } // flash just toggled
 
                       var changed = 0
                       for (i in cur.indices) {
@@ -333,7 +374,7 @@ jobs:
                   }
               }
 
-              private fun toJpeg(image: ImageProxy): ByteArray? {
+              private fun toJpeg(image: ImageProxy, maxW: Int = 0, quality: Int = 80): ByteArray? {
                   return try {
                       val bmp = image.toBitmap()
                       val rot = image.imageInfo.rotationDegrees
@@ -341,8 +382,11 @@ jobs:
                           val m = Matrix().apply { postRotate(rot.toFloat()) }
                           Bitmap.createBitmap(bmp, 0, 0, bmp.width, bmp.height, m, true)
                       } else bmp
+                      val fin = if (maxW > 0 && out.width > maxW) {
+                          Bitmap.createScaledBitmap(out, maxW, out.height * maxW / out.width, true)
+                      } else out
                       val bos = ByteArrayOutputStream()
-                      out.compress(Bitmap.CompressFormat.JPEG, 80, bos)
+                      fin.compress(Bitmap.CompressFormat.JPEG, quality, bos)
                       bos.toByteArray()
                   } catch (e: Exception) {
                       null
@@ -380,6 +424,10 @@ jobs:
 
               private val ticker = object : Runnable {
                   override fun run() {
+                      if (liveUntil != 0L && System.currentTimeMillis() > liveUntil) {
+                          liveUntil = 0L
+                          notifyText("⏹ ৩ মিনিট হয়ে গেছে, লাইভ বন্ধ। আবার দেখতে /live লিখুন।")
+                      }
                       val r = recording
                       if (r != null) {
                           val now = System.currentTimeMillis()
@@ -413,7 +461,12 @@ jobs:
                               val msg = u.optJSONObject("message") ?: continue
                               val from = msg.getJSONObject("chat").getLong("id").toString()
                               if (from != tg.chat) continue // ignore strangers
-                              handleCommand((msg.optString("text", "")).trim().lowercase(Locale.ROOT))
+                              val voice = msg.optJSONObject("voice")
+                              if (voice != null) {
+                                  playIncoming(voice.getString("file_id"))
+                              } else {
+                                  handleCommand((msg.optString("text", "")).trim().lowercase(Locale.ROOT))
+                              }
                           }
                       }
                   }.also { it.isDaemon = true; it.start() }
@@ -422,6 +475,19 @@ jobs:
               private fun handleCommand(cmd: String) {
                   when {
                       cmd.startsWith("/photo") -> wantPhoto = true
+                      cmd.startsWith("/flash") -> setTorch(cmd)
+                      cmd.startsWith("/live") -> {
+                          liveMsgId = 0L
+                          liveUntil = System.currentTimeMillis() + 180000
+                          notifyText("🔴 লাইভ শুরু হচ্ছে। প্রতি ২-৩ সেকেন্ডে ছবি বদলাবে। ৩ মিনিট পর নিজে বন্ধ হবে। আগে বন্ধ করতে /stop।")
+                      }
+                      cmd.startsWith("/listen") -> startListening()
+                      cmd.startsWith("/stop") -> {
+                          liveUntil = 0L
+                          listenUntil = 0L
+                          main.post { chunkEnd?.let { main.removeCallbacks(it); it.run() } }
+                          notifyText("⏹ লাইভ ও শোনা বন্ধ।")
+                      }
                       cmd.startsWith("/video") -> {
                           if (videoCapture == null) {
                               notifyText("এই ফোনে ভিডিও রেকর্ডিং চলে না।")
@@ -436,12 +502,131 @@ jobs:
                           val charging = isCharging()
                           notifyText(
                               "📊 অবস্থা\nব্যাটারি: ${batteryPercent()}% (${if (charging) "চার্জ হচ্ছে" else "বিদ্যুৎ নেই"})\n" +
-                                  "নিজে থেকে ছবি/ভিডিও: ${if (armed) "চালু" else "বন্ধ"}\nসময়: ${stamp()}"
+                                  "নিজে থেকে ছবি/ভিডিও: ${if (armed) "চালু" else "বন্ধ"}\nফ্ল্যাশ: ${if (torchOn) "চালু" else "বন্ধ"}\nসময়: ${stamp()}"
                           )
                       }
                       cmd.startsWith("/start") || cmd.startsWith("/help") ->
-                          notifyText("/photo ছবি\n/video ১৫ সেকেন্ডের ভিডিও\n/status অবস্থা\n/arm নড়াচড়ায় নিজে থেকে পাঠানো চালু\n/disarm বন্ধ")
+                          notifyText("/live লাইভ দেখা\n/listen আশপাশের শব্দ শোনা\nফোনে কিছু বলতে বটে ভয়েস মেসেজ পাঠান\n/stop লাইভ ও শোনা বন্ধ\n/flash ফ্ল্যাশ চালু-বন্ধ (/flash on, /flash off)\n/photo ছবি\n/video ১৫ সেকেন্ডের ভিডিও\n/status অবস্থা\n/arm নড়াচড়ায় নিজে থেকে পাঠানো চালু\n/disarm বন্ধ")
                   }
+              }
+
+              private fun hasMic(): Boolean =
+                  checkSelfPermission(Manifest.permission.RECORD_AUDIO) == PackageManager.PERMISSION_GRANTED
+
+              /** Records 10 second pieces of what the phone hears and sends each one to Telegram. */
+              private fun startListening() {
+                  if (!hasMic()) {
+                      notifyText("মাইকের অনুমতি দেওয়া নেই। ফোনের অ্যাপ সেটিংসে HomeCam এ Microphone চালু করে অ্যাপটা আবার চালু করুন।")
+                      return
+                  }
+                  listenUntil = System.currentTimeMillis() + 120000
+                  notifyText("🎧 শোনা শুরু। প্রতি ১০ সেকেন্ডের শব্দ ভয়েস মেসেজ হয়ে আসবে। ২ মিনিট পর নিজে বন্ধ হবে, আগে বন্ধ করতে /stop।")
+                  main.post { if (recorder == null) recordChunk() }
+              }
+
+              private fun recordChunk() {
+                  if (!running || System.currentTimeMillis() >= listenUntil) return
+                  val ogg = Build.VERSION.SDK_INT >= 29
+                  val f = File(cacheDir, "audio_${System.currentTimeMillis()}." + (if (ogg) "ogg" else "m4a"))
+                  try {
+                      @Suppress("DEPRECATION")
+                      val r = if (Build.VERSION.SDK_INT >= 31) MediaRecorder(this) else MediaRecorder()
+                      r.setAudioSource(MediaRecorder.AudioSource.MIC)
+                      if (ogg) {
+                          r.setOutputFormat(MediaRecorder.OutputFormat.OGG)
+                          r.setAudioEncoder(MediaRecorder.AudioEncoder.OPUS)
+                          r.setAudioEncodingBitRate(24000)
+                      } else {
+                          r.setOutputFormat(MediaRecorder.OutputFormat.MPEG_4)
+                          r.setAudioEncoder(MediaRecorder.AudioEncoder.AAC)
+                          r.setAudioEncodingBitRate(32000)
+                      }
+                      r.setAudioSamplingRate(16000)
+                      r.setOutputFile(f.absolutePath)
+                      r.prepare()
+                      r.start()
+                      recorder = r
+                      val end = Runnable { finishChunk(f, ogg) }
+                      chunkEnd = end
+                      main.postDelayed(end, 10000)
+                  } catch (e: Exception) {
+                      recorder = null
+                      f.delete()
+                      listenUntil = 0L
+                      notifyText("❌ মাইক চালু করা যায়নি: ${e.message}")
+                  }
+              }
+
+              private fun finishChunk(f: File, ogg: Boolean) {
+                  val r = recorder
+                  recorder = null
+                  chunkEnd = null
+                  var ok = true
+                  try { r?.stop() } catch (e: RuntimeException) { ok = false }
+                  try { r?.release() } catch (e: Exception) {}
+                  if (ok && f.exists() && f.length() > 0) {
+                      val cap = "🎧 " + stamp()
+                      io.execute {
+                          if (ogg) tg.sendVoice(f, cap) else tg.sendAudio(f, cap)
+                          f.delete()
+                      }
+                  } else {
+                      f.delete()
+                  }
+                  if (running && System.currentTimeMillis() < listenUntil) {
+                      recordChunk()
+                  } else if (listenUntil != 0L) {
+                      listenUntil = 0L
+                      notifyText("🎧 শোনা শেষ। আবার শুনতে /listen লিখুন।")
+                  }
+              }
+
+              /** Plays a voice message sent by the owner through the phone's speaker. */
+              private fun playIncoming(fileId: String) {
+                  val f = File(cacheDir, "in_${System.currentTimeMillis()}.ogg")
+                  if (!tg.downloadFile(fileId, f)) {
+                      notifyText("❌ ভয়েস মেসেজটা নামানো যায়নি।")
+                      return
+                  }
+                  main.post {
+                      try {
+                          val am = getSystemService(Context.AUDIO_SERVICE) as AudioManager
+                          am.setStreamVolume(AudioManager.STREAM_MUSIC, am.getStreamMaxVolume(AudioManager.STREAM_MUSIC), 0)
+                          val mp = MediaPlayer()
+                          mp.setAudioAttributes(
+                              AudioAttributes.Builder()
+                                  .setUsage(AudioAttributes.USAGE_MEDIA)
+                                  .setContentType(AudioAttributes.CONTENT_TYPE_SPEECH)
+                                  .build()
+                          )
+                          mp.setDataSource(f.absolutePath)
+                          mp.setOnCompletionListener { it.release(); f.delete() }
+                          mp.setOnErrorListener { m, _, _ -> m.release(); f.delete(); true }
+                          mp.prepare()
+                          mp.start()
+                          notifyText("🔊 আপনার কথা ফোনে বাজানো হচ্ছে।")
+                      } catch (e: Exception) {
+                          f.delete()
+                          notifyText("❌ বাজানো যায়নি: ${e.message}")
+                      }
+                  }
+              }
+
+              private fun setTorch(cmd: String) {
+                  val cam = camera
+                  if (cam == null || !cam.cameraInfo.hasFlashUnit()) {
+                      notifyText("এই ক্যামেরায় ফ্ল্যাশ নেই (সামনের ক্যামেরায় সাধারণত থাকে না)।")
+                      return
+                  }
+                  val on = when {
+                      cmd.contains(" on") -> true
+                      cmd.contains(" off") -> false
+                      else -> !torchOn
+                  }
+                  torchOn = on
+                  quietUntil = System.currentTimeMillis() + 3000
+                  main.post { cam.cameraControl.enableTorch(on) }
+                  notifyText(if (on) "🔦 ফ্ল্যাশ চালু।" else "ফ্ল্যাশ বন্ধ।")
               }
 
               private fun notifyText(t: String) {
@@ -493,6 +678,9 @@ jobs:
                   running = false
                   main.removeCallbacks(ticker)
                   try { recording?.stop() } catch (e: Exception) {}
+                  listenUntil = 0L
+                  try { recorder?.stop() } catch (e: Exception) {}
+                  try { recorder?.release() } catch (e: Exception) {}
                   try { provider?.unbindAll() } catch (e: Exception) {}
                   try { unregisterReceiver(powerReceiver) } catch (e: Exception) {}
                   try { wakeLock?.let { if (it.isHeld) it.release() } } catch (e: Exception) {}
@@ -702,6 +890,8 @@ jobs:
                   val need = ArrayList<String>()
                   if (checkSelfPermission(Manifest.permission.CAMERA) != PackageManager.PERMISSION_GRANTED)
                       need.add(Manifest.permission.CAMERA)
+                  if (checkSelfPermission(Manifest.permission.RECORD_AUDIO) != PackageManager.PERMISSION_GRANTED)
+                      need.add(Manifest.permission.RECORD_AUDIO)
                   if (Build.VERSION.SDK_INT >= 33 &&
                       checkSelfPermission(Manifest.permission.POST_NOTIFICATIONS) != PackageManager.PERMISSION_GRANTED
                   ) need.add(Manifest.permission.POST_NOTIFICATIONS)
@@ -751,8 +941,8 @@ jobs:
 
               private fun url(method: String) = "https://api.telegram.org/bot$token/$method"
 
-              private fun post(method: String, body: RequestBody): String? {
-                  for (attempt in 1..3) {
+              private fun post(method: String, body: RequestBody, tries: Int = 3): String? {
+                  for (attempt in 1..tries) {
                       try {
                           client.newCall(Request.Builder().url(url(method)).post(body).build()).execute().use { r ->
                               if (r.isSuccessful) return r.body?.string() ?: ""
@@ -781,6 +971,77 @@ jobs:
                       .addFormDataPart("photo", "photo.jpg", bytes.toRequestBody("image/jpeg".toMediaType()))
                       .build()
                   post("sendPhoto", body)
+              }
+
+              /** Sends a photo and returns its message id (used for the live view). */
+              fun sendPhotoId(bytes: ByteArray, caption: String): Long? {
+                  val body = MultipartBody.Builder().setType(MultipartBody.FORM)
+                      .addFormDataPart("chat_id", chat)
+                      .addFormDataPart("caption", caption)
+                      .addFormDataPart("photo", "photo.jpg", bytes.toRequestBody("image/jpeg".toMediaType()))
+                      .build()
+                  val r = post("sendPhoto", body, 2) ?: return null
+                  return try {
+                      JSONObject(r).getJSONObject("result").getLong("message_id")
+                  } catch (e: Exception) {
+                      null
+                  }
+              }
+
+              /** Replaces the picture of an earlier photo message, so the chat looks like a live view. */
+              fun editPhoto(messageId: Long, bytes: ByteArray, caption: String): Boolean {
+                  val media = JSONObject()
+                      .put("type", "photo")
+                      .put("media", "attach://photo")
+                      .put("caption", caption)
+                      .toString()
+                  val body = MultipartBody.Builder().setType(MultipartBody.FORM)
+                      .addFormDataPart("chat_id", chat)
+                      .addFormDataPart("message_id", messageId.toString())
+                      .addFormDataPart("media", media)
+                      .addFormDataPart("photo", "photo.jpg", bytes.toRequestBody("image/jpeg".toMediaType()))
+                      .build()
+                  return post("editMessageMedia", body, 1) != null
+              }
+
+              fun sendVoice(file: File, caption: String) {
+                  val body = MultipartBody.Builder().setType(MultipartBody.FORM)
+                      .addFormDataPart("chat_id", chat)
+                      .addFormDataPart("caption", caption)
+                      .addFormDataPart("voice", file.name, file.asRequestBody("audio/ogg".toMediaType()))
+                      .build()
+                  post("sendVoice", body)
+              }
+
+              fun sendAudio(file: File, caption: String) {
+                  val body = MultipartBody.Builder().setType(MultipartBody.FORM)
+                      .addFormDataPart("chat_id", chat)
+                      .addFormDataPart("caption", caption)
+                      .addFormDataPart("audio", file.name, file.asRequestBody("audio/mp4".toMediaType()))
+                      .build()
+                  post("sendAudio", body)
+              }
+
+              /** Downloads a file that was sent to the bot (for example a voice message). */
+              fun downloadFile(fileId: String, dest: File): Boolean {
+                  return try {
+                      val infoReq = Request.Builder().url(url("getFile") + "?file_id=" + fileId).build()
+                      val path: String = client.newCall(infoReq).execute().use { r ->
+                          if (!r.isSuccessful) return false
+                          val txt = r.body?.string() ?: return false
+                          JSONObject(txt).getJSONObject("result").getString("file_path")
+                      }
+                      val fileReq = Request.Builder()
+                          .url("https://api.telegram.org/file/bot$token/$path").build()
+                      client.newCall(fileReq).execute().use { r ->
+                          if (!r.isSuccessful) return false
+                          val b = r.body ?: return false
+                          dest.outputStream().use { out -> b.byteStream().copyTo(out) }
+                      }
+                      true
+                  } catch (e: Exception) {
+                      false
+                  }
               }
 
               fun sendVideo(file: File, caption: String) {
