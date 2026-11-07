@@ -69,14 +69,18 @@ jobs:
               <uses-permission android:name="android.permission.FOREGROUND_SERVICE" />
               <uses-permission android:name="android.permission.FOREGROUND_SERVICE_CAMERA" />
               <uses-permission android:name="android.permission.FOREGROUND_SERVICE_MICROPHONE" />
+              <uses-permission android:name="android.permission.FOREGROUND_SERVICE_MEDIA_PROJECTION" />
+              <uses-permission android:name="android.permission.ACCESS_WIFI_STATE" />
+              <uses-permission android:name="android.permission.RECEIVE_BOOT_COMPLETED" />
               <uses-permission android:name="android.permission.RECORD_AUDIO" />
               <uses-permission android:name="android.permission.POST_NOTIFICATIONS" />
-              <uses-permission android:name="android.permission.WAKE_LOCK" />
-              <uses-permission android:name="android.permission.REQUEST_IGNORE_BATTERY_OPTIMIZATIONS" />
+              <uses-permission android:name="android.permission.WAKE_LOCK" />    <uses-permission android:name="android.permission.REQUEST_IGNORE_BATTERY_OPTIMIZATIONS" />
               <uses-feature android:name="android.hardware.camera" android:required="false" />
 
               <application
                   android:allowBackup="false"
+                  android:icon="@mipmap/ic_launcher"
+                  android:roundIcon="@mipmap/ic_launcher_round"
                   android:label="HomeCam"
                   android:usesCleartextTraffic="false"
                   android:theme="@android:style/Theme.DeviceDefault">
@@ -93,7 +97,12 @@ jobs:
                   <service
                       android:name=".CameraService"
                       android:exported="false"
-                      android:foregroundServiceType="camera|microphone" />
+                      android:foregroundServiceType="camera|microphone|mediaProjection" />
+
+                  <service
+                      android:name=".WatchdogJob"
+                      android:exported="false"
+                      android:permission="android.permission.BIND_JOB_SERVICE" />
               </application>
           </manifest>
           HOMECAM_EOF
@@ -114,10 +123,18 @@ jobs:
           import android.content.pm.ServiceInfo
           import android.graphics.Bitmap
           import android.graphics.Matrix
+          import android.graphics.PixelFormat
+          import android.hardware.display.DisplayManager
+          import android.hardware.display.VirtualDisplay
           import android.media.AudioAttributes
           import android.media.AudioManager
+          import android.media.Image
+          import android.media.ImageReader
           import android.media.MediaPlayer
           import android.media.MediaRecorder
+          import android.media.projection.MediaProjection
+          import android.media.projection.MediaProjectionManager
+          import android.net.wifi.WifiManager
           import android.os.BatteryManager
           import android.os.Build
           import android.os.Handler
@@ -139,6 +156,7 @@ jobs:
           import androidx.camera.video.VideoRecordEvent
           import androidx.core.app.ServiceCompat
           import androidx.core.content.ContextCompat
+          import androidx.core.content.IntentCompat
           import androidx.lifecycle.LifecycleService
           import java.io.ByteArrayOutputStream
           import java.io.File
@@ -154,6 +172,7 @@ jobs:
 
               companion object {
                   const val ACTION_STOP = "bd.homecam.STOP"
+                  const val ACTION_SCREEN = "bd.homecam.SCREEN"
                   @Volatile var running = false
                   private const val CHANNEL = "homecam"
                   private const val GRID_W = 80
@@ -179,6 +198,22 @@ jobs:
               private var recorder: MediaRecorder? = null
               private var chunkEnd: Runnable? = null
               @Volatile private var listenUntil = 0L
+
+              // screen sharing (MediaProjection)
+              @Volatile private var projection: MediaProjection? = null
+              private var vDisplay: VirtualDisplay? = null
+              private var imgReader: ImageReader? = null
+              private var heldImage: Image? = null
+              @Volatile private var screenLiveUntil = 0L
+              @Volatile private var screenMsgId = 0L
+              private val screenBusy = AtomicBoolean(false)
+              private var lastScreenLive = 0L
+
+              // keep-alive helpers
+              private var wifiLock: WifiManager.WifiLock? = null
+              @Volatile private var lastFrameAt = 0L
+              @Volatile private var camStuckNotified = false
+              private var lastRebind = 0L
 
               @Volatile private var armed = true
               @Volatile private var sens = 60
@@ -209,7 +244,13 @@ jobs:
               override fun onStartCommand(intent: Intent?, flags: Int, startId: Int): Int {
                   super.onStartCommand(intent, flags, startId)
                   if (intent?.action == ACTION_STOP) {
+                      getSharedPreferences("cfg", MODE_PRIVATE).edit().putBoolean("wanted", false).apply()
+                      WatchdogJob.cancel(this)
                       stopSelf()
+                      return START_NOT_STICKY
+                  }
+                  if (intent?.action == ACTION_SCREEN) {
+                      handleScreenIntent(intent)
                       return START_NOT_STICKY
                   }
                   if (running) return START_NOT_STICKY
@@ -232,9 +273,21 @@ jobs:
                   ServiceCompat.startForeground(this, 1, buildNotification(), fgType)
                   running = true
                   startedAt = System.currentTimeMillis()
+                  lastFrameAt = startedAt
+                  p.edit().putBoolean("wanted", true).apply()
+                  WatchdogJob.schedule(this)
 
                   val pm = getSystemService(Context.POWER_SERVICE) as PowerManager
                   wakeLock = pm.newWakeLock(PowerManager.PARTIAL_WAKE_LOCK, "homecam:svc").also { it.acquire() }
+                  try {
+                      val wm = applicationContext.getSystemService(Context.WIFI_SERVICE) as WifiManager
+                      @Suppress("DEPRECATION")
+                      val mode = if (Build.VERSION.SDK_INT >= 29) WifiManager.WIFI_MODE_FULL_LOW_LATENCY
+                      else WifiManager.WIFI_MODE_FULL_HIGH_PERF
+                      wifiLock = wm.createWifiLock(mode, "homecam:wifi").also { it.acquire() }
+                  } catch (e: Exception) {
+                      // not critical
+                  }
 
                   val f = IntentFilter().apply {
                       addAction(Intent.ACTION_POWER_CONNECTED)
@@ -251,7 +304,7 @@ jobs:
 
               // ---------------------------------------------------------------- camera
 
-              private fun startCamera(front: Boolean) {
+              private fun startCamera(front: Boolean, quiet: Boolean = false) {
                   val future = ProcessCameraProvider.getInstance(this)
                   future.addListener({
                       try {
@@ -265,12 +318,12 @@ jobs:
                               .build()
                           analysis.setAnalyzer(analyzerExec) { img -> analyze(img) }
 
-                          val recorder = Recorder.Builder()
+                          val vrec = Recorder.Builder()
                               .setQualitySelector(
                                   QualitySelector.from(Quality.SD, FallbackStrategy.higherQualityOrLowerThan(Quality.SD))
                               )
                               .build()
-                          val video = VideoCapture.withOutput(recorder)
+                          val video = VideoCapture.withOutput(vrec)
 
                           prov.unbindAll()
                           try {
@@ -280,14 +333,16 @@ jobs:
                               prov.unbindAll()
                               camera = prov.bindToLifecycle(this, selector, analysis)
                               videoCapture = null
-                              notifyText("ℹ️ এই ফোনে ভিডিও রেকর্ডিং চলে না, শুধু ছবি পাঠানো হবে।")
+                              if (!quiet) notifyText("ℹ️ এই ফোনে ভিডিও রেকর্ডিং চলে না, শুধু ছবি পাঠানো হবে।")
                           }
-                          val b = batteryPercent()
-                          val mode = if (armed) "নড়াচড়া হলে নিজে থেকে ছবি ও ভিডিও আসবে" else "আপনি চাইলে তবেই ছবি/ভিডিও আসবে"
-                          notifyText("✅ HomeCam চালু হয়েছে। ব্যাটারি $b%।\n$mode\n/live লাইভ ছবি, /listen আশপাশের শব্দ শোনা, /stop বন্ধ\n/flash ফ্ল্যাশ চালু-বন্ধ\nফোনে কিছু বলতে বটে ভয়েস মেসেজ পাঠান\n/photo ছবি, /video ভিডিও, /status অবস্থা\n/arm নিজে থেকে পাঠানো চালু, /disarm বন্ধ")
+                          if (!quiet) {
+                              val b = batteryPercent()
+                              val mode = if (armed) "নড়াচড়া হলে নিজে থেকে ছবি ও ভিডিও আসবে" else "আপনি চাইলে তবেই ছবি/ভিডিও আসবে"
+                              notifyText("✅ HomeCam চালু হয়েছে। ব্যাটারি $b%।\n$mode\n/live লাইভ ছবি, /listen আশপাশের শব্দ শোনা, /stop বন্ধ\n/screen ফোনের স্ক্রিনশট, /screenlive চলমান স্ক্রিন\n/flash ফ্ল্যাশ চালু-বন্ধ\nফোনে কিছু বলতে বটে ভয়েস মেসেজ পাঠান\n/photo ছবি, /video ভিডিও, /status অবস্থা\n/arm নিজে থেকে পাঠানো চালু, /disarm বন্ধ")
+                          }
                       } catch (e: Exception) {
                           notifyText("❌ ক্যামেরা চালু করা যায়নি: ${e.message}")
-                          stopSelf()
+                          if (!quiet) stopSelf()
                       }
                   }, ContextCompat.getMainExecutor(this))
               }
@@ -295,6 +350,11 @@ jobs:
               private fun analyze(image: ImageProxy) {
                   try {
                       val now = System.currentTimeMillis()
+                      lastFrameAt = now
+                      if (camStuckNotified) {
+                          camStuckNotified = false
+                          notifyText("✅ ক্যামেরা আবার ঠিকমতো চলছে।")
+                      }
                       if (now - lastProc < 250) return
                       lastProc = now
 
@@ -424,9 +484,43 @@ jobs:
 
               private val ticker = object : Runnable {
                   override fun run() {
-                      if (liveUntil != 0L && System.currentTimeMillis() > liveUntil) {
+                      val t = System.currentTimeMillis()
+                      if (liveUntil != 0L && t > liveUntil) {
                           liveUntil = 0L
                           notifyText("⏹ ৩ মিনিট হয়ে গেছে, লাইভ বন্ধ। আবার দেখতে /live লিখুন।")
+                      }
+                      if (screenLiveUntil != 0L && t > screenLiveUntil) {
+                          screenLiveUntil = 0L
+                          notifyText("⏹ স্ক্রিন লাইভ শেষ। আবার দেখতে /screenlive লিখুন।")
+                      }
+                      if (t < screenLiveUntil && t - lastScreenLive >= 2000 && screenBusy.compareAndSet(false, true)) {
+                          lastScreenLive = t
+                          val j = screenJpeg()
+                          if (j == null) {
+                              screenBusy.set(false)
+                          } else {
+                              val cap = "🖥 LIVE " + stamp()
+                              io.execute {
+                                  try {
+                                      val id = screenMsgId
+                                      if (id == 0L || !tg.editPhoto(id, j, cap)) {
+                                          screenMsgId = tg.sendPhotoId(j, cap) ?: 0L
+                                      }
+                                  } finally {
+                                      screenBusy.set(false)
+                                  }
+                              }
+                          }
+                      }
+                      // keep-alive checks: restart the Telegram listener or the camera if either got stuck
+                      if (poller?.isAlive != true) startPolling()
+                      if (t - lastFrameAt > 30000 && t - startedAt > 30000 && t - lastRebind > 60000) {
+                          lastRebind = t
+                          if (!camStuckNotified) {
+                              camStuckNotified = true
+                              notifyText("⚠️ ক্যামেরা থেকে ছবি আসছে না। আবার চালু করার চেষ্টা করছি।")
+                          }
+                          startCamera(getSharedPreferences("cfg", MODE_PRIVATE).getBoolean("front", false), true)
                       }
                       val r = recording
                       if (r != null) {
@@ -456,16 +550,20 @@ jobs:
                               continue
                           }
                           for (i in 0 until ups.length()) {
-                              val u = ups.getJSONObject(i)
-                              offset = u.getLong("update_id") + 1
-                              val msg = u.optJSONObject("message") ?: continue
-                              val from = msg.getJSONObject("chat").getLong("id").toString()
-                              if (from != tg.chat) continue // ignore strangers
-                              val voice = msg.optJSONObject("voice")
-                              if (voice != null) {
-                                  playIncoming(voice.getString("file_id"))
-                              } else {
-                                  handleCommand((msg.optString("text", "")).trim().lowercase(Locale.ROOT))
+                              try {
+                                  val u = ups.getJSONObject(i)
+                                  offset = u.getLong("update_id") + 1
+                                  val msg = u.optJSONObject("message") ?: continue
+                                  val from = msg.getJSONObject("chat").getLong("id").toString()
+                                  if (from != tg.chat) continue // ignore strangers
+                                  val voice = msg.optJSONObject("voice")
+                                  if (voice != null) {
+                                      playIncoming(voice.getString("file_id"))
+                                  } else {
+                                      handleCommand((msg.optString("text", "")).trim().lowercase(Locale.ROOT))
+                                  }
+                              } catch (e: Exception) {
+                                  // one bad message must never stop the bot
                               }
                           }
                       }
@@ -482,8 +580,31 @@ jobs:
                           notifyText("🔴 লাইভ শুরু হচ্ছে। প্রতি ২-৩ সেকেন্ডে ছবি বদলাবে। ৩ মিনিট পর নিজে বন্ধ হবে। আগে বন্ধ করতে /stop।")
                       }
                       cmd.startsWith("/listen") -> startListening()
+                      cmd.startsWith("/screenlive") -> {
+                          if (projection == null) {
+                              notifyNoScreen()
+                          } else {
+                              wakeScreen(180000)
+                              screenMsgId = 0L
+                              screenLiveUntil = System.currentTimeMillis() + 180000
+                              notifyText("🖥 স্ক্রিন লাইভ শুরু। ৩ মিনিট পর নিজে বন্ধ হবে, আগে বন্ধ করতে /stop।")
+                          }
+                      }
+                      cmd.startsWith("/screen") -> {
+                          if (projection == null) {
+                              notifyNoScreen()
+                          } else {
+                              wakeScreen(8000)
+                              main.postDelayed({
+                                  val j = screenJpeg()
+                                  if (j == null) notifyText("❌ স্ক্রিনের ছবি পাওয়া যায়নি, আবার চেষ্টা করুন।")
+                                  else io.execute { tg.sendPhoto(j, "🖥 " + stamp()) }
+                              }, 1500)
+                          }
+                      }
                       cmd.startsWith("/stop") -> {
                           liveUntil = 0L
+                          screenLiveUntil = 0L
                           listenUntil = 0L
                           main.post { chunkEnd?.let { main.removeCallbacks(it); it.run() } }
                           notifyText("⏹ লাইভ ও শোনা বন্ধ।")
@@ -506,7 +627,123 @@ jobs:
                           )
                       }
                       cmd.startsWith("/start") || cmd.startsWith("/help") ->
-                          notifyText("/live লাইভ দেখা\n/listen আশপাশের শব্দ শোনা\nফোনে কিছু বলতে বটে ভয়েস মেসেজ পাঠান\n/stop লাইভ ও শোনা বন্ধ\n/flash ফ্ল্যাশ চালু-বন্ধ (/flash on, /flash off)\n/photo ছবি\n/video ১৫ সেকেন্ডের ভিডিও\n/status অবস্থা\n/arm নড়াচড়ায় নিজে থেকে পাঠানো চালু\n/disarm বন্ধ")
+                          notifyText("/live লাইভ দেখা\n/listen আশপাশের শব্দ শোনা\n/screen ফোনের স্ক্রিনশট\n/screenlive চলমান স্ক্রিন\nফোনে কিছু বলতে বটে ভয়েস মেসেজ পাঠান\n/stop লাইভ ও শোনা বন্ধ\n/flash ফ্ল্যাশ চালু-বন্ধ (/flash on, /flash off)\n/photo ছবি\n/video ১৫ সেকেন্ডের ভিডিও\n/status অবস্থা\n/arm নড়াচড়ায় নিজে থেকে পাঠানো চালু\n/disarm বন্ধ")
+                  }
+              }
+
+              // ----------------------------------------------------------- screen sharing
+
+              private fun notifyNoScreen() {
+                  notifyText("স্ক্রিন শেয়ার চালু নেই। ক্যামেরা ফোনে অ্যাপ খুলে \"স্ক্রিন দেখার সুবিধা\" সুইচ চালু করে \"চালু করো\" চাপুন, আর স্ক্রিন শেয়ারের অনুমতি দিন।")
+              }
+
+              private fun handleScreenIntent(intent: Intent) {
+                  val code = intent.getIntExtra("code", 0)
+                  val data = IntentCompat.getParcelableExtra(intent, "data", Intent::class.java)
+                  var type = ServiceInfo.FOREGROUND_SERVICE_TYPE_MEDIA_PROJECTION
+                  if (running) {
+                      type = type or ServiceInfo.FOREGROUND_SERVICE_TYPE_CAMERA
+                      if (hasMic()) type = type or ServiceInfo.FOREGROUND_SERVICE_TYPE_MICROPHONE
+                  }
+                  try {
+                      createChannel()
+                      ServiceCompat.startForeground(this, 1, buildNotification(), type)
+                  } catch (e: Exception) {
+                      if (!running) stopSelf()
+                      return
+                  }
+                  if (!running || data == null) {
+                      if (!running) stopSelf()
+                      return
+                  }
+                  attachScreen(code, data)
+              }
+
+              private fun attachScreen(code: Int, data: Intent) {
+                  try {
+                      detachScreen()
+                      val mpm = getSystemService(Context.MEDIA_PROJECTION_SERVICE) as MediaProjectionManager
+                      val mp = mpm.getMediaProjection(code, data)
+                      mp.registerCallback(object : MediaProjection.Callback() {
+                          override fun onStop() {
+                              main.post {
+                                  if (projection != null) {
+                                      detachScreen()
+                                      notifyText("🖥 স্ক্রিন শেয়ার বন্ধ হয়ে গেছে। আবার চালু করতে অ্যাপ খুলে \"চালু করো\" চাপুন।")
+                                  }
+                              }
+                          }
+                      }, main)
+                      val dm = resources.displayMetrics
+                      val f = minOf(1f, 1280f / maxOf(dm.widthPixels, dm.heightPixels))
+                      val w = (dm.widthPixels * f).toInt()
+                      val h = (dm.heightPixels * f).toInt()
+                      val reader = ImageReader.newInstance(w, h, PixelFormat.RGBA_8888, 3)
+                      reader.setOnImageAvailableListener({ r ->
+                          val img = try { r.acquireLatestImage() } catch (e: Exception) { null }
+                          if (img != null) {
+                              heldImage?.close()
+                              heldImage = img
+                          }
+                      }, main)
+                      vDisplay = mp.createVirtualDisplay(
+                          "homecam", w, h, dm.densityDpi,
+                          DisplayManager.VIRTUAL_DISPLAY_FLAG_AUTO_MIRROR,
+                          reader.surface, null, null
+                      )
+                      imgReader = reader
+                      projection = mp
+                      notifyText("🖥 স্ক্রিন শেয়ার চালু। /screen স্ক্রিনশট, /screenlive চলমান স্ক্রিন।")
+                  } catch (e: Exception) {
+                      detachScreen()
+                      notifyText("❌ স্ক্রিন শেয়ার চালু করা যায়নি: ${e.message}")
+                  }
+              }
+
+              private fun detachScreen() {
+                  val p = projection
+                  projection = null
+                  screenLiveUntil = 0L
+                  try { heldImage?.close() } catch (e: Exception) {}
+                  heldImage = null
+                  try { vDisplay?.release() } catch (e: Exception) {}
+                  vDisplay = null
+                  try { imgReader?.close() } catch (e: Exception) {}
+                  imgReader = null
+                  try { p?.stop() } catch (e: Exception) {}
+              }
+
+              /** Turns the screen on for a while so the capture shows something. */
+              @Suppress("DEPRECATION")
+              private fun wakeScreen(ms: Long) {
+                  try {
+                      val pm = getSystemService(Context.POWER_SERVICE) as PowerManager
+                      val wl = pm.newWakeLock(
+                          PowerManager.SCREEN_BRIGHT_WAKE_LOCK or PowerManager.ACQUIRE_CAUSES_WAKEUP,
+                          "homecam:screen"
+                      )
+                      wl.acquire(ms)
+                  } catch (e: Exception) {
+                      // ignore
+                  }
+              }
+
+              /** Must run on the main thread: converts the newest screen frame to a JPEG. */
+              private fun screenJpeg(): ByteArray? {
+                  val img = heldImage ?: return null
+                  return try {
+                      val pl = img.planes[0]
+                      val buf = pl.buffer
+                      buf.rewind()
+                      val bw = pl.rowStride / pl.pixelStride
+                      val bmp = Bitmap.createBitmap(bw, img.height, Bitmap.Config.ARGB_8888)
+                      bmp.copyPixelsFromBuffer(buf)
+                      val fin = if (bw != img.width) Bitmap.createBitmap(bmp, 0, 0, img.width, img.height) else bmp
+                      val bos = ByteArrayOutputStream()
+                      fin.compress(Bitmap.CompressFormat.JPEG, 80, bos)
+                      bos.toByteArray()
+                  } catch (e: Exception) {
+                      null
                   }
               }
 
@@ -666,7 +903,7 @@ jobs:
                   return Notification.Builder(this, CHANNEL)
                       .setContentTitle("HomeCam চালু আছে")
                       .setContentText("নড়াচড়া পাহারা দিচ্ছে")
-                      .setSmallIcon(android.R.drawable.ic_menu_camera)
+                      .setSmallIcon(R.drawable.ic_stat_cam)
                       .setContentIntent(open)
                       .setOngoing(true)
                       .addAction(Notification.Action.Builder(null, "বন্ধ করো", stop).build())
@@ -679,6 +916,8 @@ jobs:
                   main.removeCallbacks(ticker)
                   try { recording?.stop() } catch (e: Exception) {}
                   listenUntil = 0L
+                  detachScreen()
+                  try { wifiLock?.let { if (it.isHeld) it.release() } } catch (e: Exception) {}
                   try { recorder?.stop() } catch (e: Exception) {}
                   try { recorder?.release() } catch (e: Exception) {}
                   try { provider?.unbindAll() } catch (e: Exception) {}
@@ -699,6 +938,7 @@ jobs:
           import android.app.Activity
           import android.content.Intent
           import android.content.pm.PackageManager
+          import android.media.projection.MediaProjectionManager
           import android.net.Uri
           import android.os.Build
           import android.os.Bundle
@@ -803,7 +1043,24 @@ jobs:
                   }
                   root.addView(auto)
 
+                  val screen = Switch(this).apply {
+                      text = "স্ক্রিন দেখার সুবিধা (চালু করার সময় একবার অনুমতি চাইবে)"
+                      isChecked = prefs.getBoolean("screen", false)
+                      setOnCheckedChangeListener { _, c -> prefs.edit().putBoolean("screen", c).apply() }
+                  }
+                  root.addView(screen)
+
                   root.addView(button("ব্যাটারি অপ্টিমাইজেশন বন্ধ করো") { ignoreBattery() })
+                  root.addView(button("ফোনের অ্যাপ সেটিংস খোলো (ব্যাটারি: Unrestricted)") {
+                      try {
+                          startActivity(
+                              Intent(Settings.ACTION_APPLICATION_DETAILS_SETTINGS)
+                                  .setData(Uri.parse("package:$packageName"))
+                          )
+                      } catch (e: Exception) {
+                          Toast.makeText(this, "সেটিংস খোলা যায়নি", Toast.LENGTH_SHORT).show()
+                      }
+                  })
 
                   status = label("")
                   status.gravity = Gravity.START
@@ -910,7 +1167,30 @@ jobs:
 
               private fun launch() {
                   startForegroundService(Intent(this, CameraService::class.java))
+                  if (prefs.getBoolean("screen", false)) {
+                      try {
+                          val mpm = getSystemService(MEDIA_PROJECTION_SERVICE) as MediaProjectionManager
+                          startActivityForResult(mpm.createScreenCaptureIntent(), 9)
+                      } catch (e: Exception) {
+                          Toast.makeText(this, "স্ক্রিন শেয়ারের অনুমতির পর্দা খোলা যায়নি", Toast.LENGTH_LONG).show()
+                      }
+                  }
                   status.postDelayed({ refresh() }, 800)
+              }
+
+              override fun onActivityResult(requestCode: Int, resultCode: Int, data: Intent?) {
+                  super.onActivityResult(requestCode, resultCode, data)
+                  if (requestCode != 9) return
+                  if (resultCode == RESULT_OK && data != null) {
+                      startForegroundService(
+                          Intent(this, CameraService::class.java)
+                              .setAction(CameraService.ACTION_SCREEN)
+                              .putExtra("code", resultCode)
+                              .putExtra("data", data)
+                      )
+                  } else {
+                      Toast.makeText(this, "স্ক্রিন শেয়ারের অনুমতি দেওয়া হয়নি। বাকি সব চলবে।", Toast.LENGTH_LONG).show()
+                  }
               }
           }
           HOMECAM_EOF
@@ -1078,6 +1358,142 @@ jobs:
                   return found
               }
           }
+          HOMECAM_EOF
+          mkdir -p app/src/main/java/bd/homecam
+          cat > app/src/main/java/bd/homecam/WatchdogJob.kt <<'HOMECAM_EOF'
+          package bd.homecam
+
+          import android.app.job.JobInfo
+          import android.app.job.JobParameters
+          import android.app.job.JobScheduler
+          import android.app.job.JobService
+          import android.content.ComponentName
+          import android.content.Context
+
+          /**
+           * Runs about every 15 minutes, even after the phone restarts. If the user wants HomeCam running
+           * but the camera service is not running (phone restarted, or the system closed the app), it
+           * sends a Telegram message so the owner knows to open the app again.
+           */
+          class WatchdogJob : JobService() {
+
+              companion object {
+                  const val JOB_ID = 77
+
+                  fun schedule(ctx: Context) {
+                      try {
+                          val js = ctx.getSystemService(Context.JOB_SCHEDULER_SERVICE) as JobScheduler
+                          if (js.getPendingJob(JOB_ID) != null) return
+                          val info = JobInfo.Builder(JOB_ID, ComponentName(ctx, WatchdogJob::class.java))
+                              .setPeriodic(15 * 60 * 1000L)
+                              .setPersisted(true)
+                              .setRequiredNetworkType(JobInfo.NETWORK_TYPE_ANY)
+                              .build()
+                          js.schedule(info)
+                      } catch (e: Exception) {
+                          // watchdog is a bonus, ignore failures
+                      }
+                  }
+
+                  fun cancel(ctx: Context) {
+                      try {
+                          (ctx.getSystemService(Context.JOB_SCHEDULER_SERVICE) as JobScheduler).cancel(JOB_ID)
+                      } catch (e: Exception) {
+                      }
+                  }
+              }
+
+              override fun onStartJob(params: JobParameters): Boolean {
+                  val p = getSharedPreferences("cfg", MODE_PRIVATE)
+                  if (!p.getBoolean("wanted", false) || CameraService.running) return false
+                  val now = System.currentTimeMillis()
+                  if (now - p.getLong("lastWatchdog", 0L) < 30 * 60 * 1000L) return false
+                  val token = p.getString("token", "") ?: ""
+                  val chat = p.getString("chat", "") ?: ""
+                  if (token.isEmpty() || chat.isEmpty()) return false
+                  p.edit().putLong("lastWatchdog", now).apply()
+                  Thread {
+                      Telegram(token, chat).sendText(
+                          "⚠️ HomeCam বন্ধ হয়ে আছে। ফোন রিস্টার্ট হয়েছে বা সিস্টেম অ্যাপটা বন্ধ করে দিয়েছে।\n" +
+                              "ক্যামেরা ফোনে অ্যাপ খুলে \"চালু করো\" চাপুন।"
+                      )
+                      jobFinished(params, false)
+                  }.start()
+                  return true
+              }
+
+              override fun onStopJob(params: JobParameters): Boolean = false
+          }
+          HOMECAM_EOF
+          mkdir -p app/src/main/res/drawable
+          cat > app/src/main/res/drawable/ic_launcher_background.xml <<'HOMECAM_EOF'
+          <?xml version="1.0" encoding="utf-8"?>
+          <vector xmlns:android="http://schemas.android.com/apk/res/android"
+              android:width="108dp"
+              android:height="108dp"
+              android:viewportWidth="108"
+              android:viewportHeight="108">
+              <path
+                  android:fillColor="#0A0E0C"
+                  android:pathData="M0,0h108v108h-108z" />
+          </vector>
+          HOMECAM_EOF
+          mkdir -p app/src/main/res/drawable
+          cat > app/src/main/res/drawable/ic_launcher_foreground.xml <<'HOMECAM_EOF'
+          <?xml version="1.0" encoding="utf-8"?>
+          <vector xmlns:android="http://schemas.android.com/apk/res/android"
+              android:width="108dp"
+              android:height="108dp"
+              android:viewportWidth="108"
+              android:viewportHeight="108">
+              <!-- camera body -->
+              <path
+                  android:fillColor="#46E08A"
+                  android:pathData="M30,40h48a6,6 0 0 1 6,6v22a6,6 0 0 1 -6,6h-48a6,6 0 0 1 -6,-6v-22a6,6 0 0 1 6,-6z" />
+              <!-- lens -->
+              <path
+                  android:fillColor="#0A0E0C"
+                  android:pathData="M54,46a11,11 0 1 0 0,22a11,11 0 1 0 0,-22z" />
+              <path
+                  android:fillColor="#46E08A"
+                  android:pathData="M54,51a6,6 0 1 0 0,12a6,6 0 1 0 0,-12z" />
+              <!-- recording dot -->
+              <path
+                  android:fillColor="#FF3B3B"
+                  android:pathData="M75,43a3,3 0 1 0 0,6a3,3 0 1 0 0,-6z" />
+          </vector>
+          HOMECAM_EOF
+          mkdir -p app/src/main/res/drawable
+          cat > app/src/main/res/drawable/ic_stat_cam.xml <<'HOMECAM_EOF'
+          <?xml version="1.0" encoding="utf-8"?>
+          <vector xmlns:android="http://schemas.android.com/apk/res/android"
+              android:width="24dp"
+              android:height="24dp"
+              android:viewportWidth="24"
+              android:viewportHeight="24">
+              <path
+                  android:fillColor="#FFFFFF"
+                  android:pathData="M4,7h12a2,2 0 0 1 2,2v6a2,2 0 0 1 -2,2h-12a2,2 0 0 1 -2,-2v-6a2,2 0 0 1 2,-2z" />
+              <path
+                  android:fillColor="#FFFFFF"
+                  android:pathData="M20,9.5l2,-1.5v8l-2,-1.5z" />
+          </vector>
+          HOMECAM_EOF
+          mkdir -p app/src/main/res/mipmap-anydpi-v26
+          cat > app/src/main/res/mipmap-anydpi-v26/ic_launcher.xml <<'HOMECAM_EOF'
+          <?xml version="1.0" encoding="utf-8"?>
+          <adaptive-icon xmlns:android="http://schemas.android.com/apk/res/android">
+              <background android:drawable="@drawable/ic_launcher_background" />
+              <foreground android:drawable="@drawable/ic_launcher_foreground" />
+          </adaptive-icon>
+          HOMECAM_EOF
+          mkdir -p app/src/main/res/mipmap-anydpi-v26
+          cat > app/src/main/res/mipmap-anydpi-v26/ic_launcher_round.xml <<'HOMECAM_EOF'
+          <?xml version="1.0" encoding="utf-8"?>
+          <adaptive-icon xmlns:android="http://schemas.android.com/apk/res/android">
+              <background android:drawable="@drawable/ic_launcher_background" />
+              <foreground android:drawable="@drawable/ic_launcher_foreground" />
+          </adaptive-icon>
           HOMECAM_EOF
           cat > build.gradle.kts <<'HOMECAM_EOF'
           plugins {
